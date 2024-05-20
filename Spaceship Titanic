@@ -1,0 +1,231 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, PowerTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+import xgboost as xgb
+from catboost import CatBoostClassifier
+import lightgbm as lgb
+import optuna
+from optuna.samplers import TPESampler
+
+# Load data
+file_path = 'train.csv'
+data = pd.read_csv(file_path)
+
+# Check for class imbalance
+sns.countplot(x='Transported', data=data)
+plt.show()
+
+# Check for outliers in numeric features
+numeric_features = ['Age', 'RoomService', 'FoodCourt', 'ShoppingMall', 'Spa', 'VRDeck']
+data[numeric_features].describe()
+
+# Visualize outliers
+for feature in numeric_features:
+    sns.boxplot(x='Transported', y=feature, data=data)
+    plt.show()
+
+# Feature Engineering
+# Split Cabin into deck, num, and side
+data[['Cabin_deck', 'Cabin_num', 'Cabin_side']] = data['Cabin'].str.split('/', expand=True)
+data['Cabin_num'] = pd.to_numeric(data['Cabin_num'], errors='coerce')
+
+# Aggregating spending features
+data['Total_Spending'] = data[['RoomService', 'FoodCourt', 'ShoppingMall', 'Spa', 'VRDeck']].sum(axis=1)
+data['Spending_Ratio'] = data['Total_Spending'] / data['Age']
+
+# Extract length of the name as a feature
+data['Name_Length'] = data['Name'].apply(lambda x: len(str(x)))
+
+# Handle outliers by capping at the 95th percentile
+for feature in numeric_features:
+    upper_limit = data[feature].quantile(0.95)
+    data[feature] = np.where(data[feature] > upper_limit, upper_limit, data[feature])
+
+# Feature Interaction
+data['Age_TotalSpending'] = data['Age'] * data['Total_Spending']
+data['Age_SpendingRatio'] = data['Age'] * data['Spending_Ratio']
+data['TotalSpending_SpendingRatio'] = data['Total_Spending'] * data['Spending_Ratio']
+
+# Update numeric features list
+numeric_features.extend(['Age_TotalSpending', 'Age_SpendingRatio', 'TotalSpending_SpendingRatio'])
+
+# Convert all categorical columns to strings
+categorical_features = ['HomePlanet', 'CryoSleep', 'Destination', 'VIP', 'Cabin_deck', 'Cabin_side']
+data[categorical_features] = data[categorical_features].astype(str)
+
+# Define target variable
+X = data.drop('Transported', axis=1)
+y = data['Transported'].astype(int)
+
+# Preprocessing
+numeric_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler()),
+    ('power_transformer', PowerTransformer())])
+
+categorical_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+    ('encoder', OneHotEncoder(handle_unknown='ignore'))])
+
+preprocessor = ColumnTransformer([
+    ('num', numeric_transformer, numeric_features),
+    ('cat', categorical_transformer, categorical_features)])
+
+# Define objective function for Optuna
+def objective(trial):
+    rf_n_estimators = trial.suggest_int('rf_n_estimators', 100, 300)
+    rf_max_depth = trial.suggest_int('rf_max_depth', 3, 10)
+    rf_min_samples_split = trial.suggest_int('rf_min_samples_split', 2, 10)
+    rf_min_samples_leaf = trial.suggest_int('rf_min_samples_leaf', 1, 4)
+    
+    gbc_n_estimators = trial.suggest_int('gbc_n_estimators', 100, 300)
+    gbc_learning_rate = trial.suggest_float('gbc_learning_rate', 0.01, 0.1)
+    gbc_max_depth = trial.suggest_int('gbc_max_depth', 3, 7)
+    
+    xgb_n_estimators = trial.suggest_int('xgb_n_estimators', 100, 300)
+    xgb_learning_rate = trial.suggest_float('xgb_learning_rate', 0.01, 0.1)
+    xgb_max_depth = trial.suggest_int('xgb_max_depth', 3, 7)
+    xgb_subsample = trial.suggest_float('xgb_subsample', 0.5, 1.0)
+    xgb_colsample_bytree = trial.suggest_float('xgb_colsample_bytree', 0.5, 1.0)
+    
+    catboost_iterations = trial.suggest_int('catboost_iterations', 100, 300)
+    catboost_learning_rate = trial.suggest_float('catboost_learning_rate', 0.01, 0.1)
+    catboost_depth = trial.suggest_int('catboost_depth', 3, 10)
+
+    lgb_n_estimators = trial.suggest_int('lgb_n_estimators', 100, 300)
+    lgb_learning_rate = trial.suggest_float('lgb_learning_rate', 0.01, 0.1)
+    lgb_max_depth = trial.suggest_int('lgb_max_depth', 3, 10)
+    lgb_num_leaves = trial.suggest_int('lgb_num_leaves', 31, 128)
+    lgb_min_data_in_leaf = trial.suggest_int('lgb_min_data_in_leaf', 20, 50)
+
+    rf = RandomForestClassifier(
+        n_estimators=rf_n_estimators,
+        max_depth=rf_max_depth,
+        min_samples_split=rf_min_samples_split,
+        min_samples_leaf=rf_min_samples_leaf,
+        random_state=42
+    )
+    gbc = GradientBoostingClassifier(
+        n_estimators=gbc_n_estimators,
+        learning_rate=gbc_learning_rate,
+        max_depth=gbc_max_depth,
+        random_state=42
+    )
+    xgb_clf = xgb.XGBClassifier(
+        n_estimators=xgb_n_estimators,
+        learning_rate=xgb_learning_rate,
+        max_depth=xgb_max_depth,
+        subsample=xgb_subsample,
+        colsample_bytree=xgb_colsample_bytree,
+        random_state=42
+    )
+    catboost_clf = CatBoostClassifier(
+        iterations=catboost_iterations,
+        learning_rate=catboost_learning_rate,
+        depth=catboost_depth,
+        silent=True,
+        random_state=42
+    )
+    lgb_clf = lgb.LGBMClassifier(
+        n_estimators=lgb_n_estimators,
+        learning_rate=lgb_learning_rate,
+        max_depth=lgb_max_depth,
+        num_leaves=lgb_num_leaves,
+        min_data_in_leaf=lgb_min_data_in_leaf,
+        random_state=42
+    )
+
+    stacking_clf = StackingClassifier(
+        estimators=[
+            ('rf', rf),
+            ('gbc', gbc),
+            ('xgb', xgb_clf),
+            ('catboost', catboost_clf),
+            ('lgb', lgb_clf)
+        ],
+        final_estimator=LogisticRegression(max_iter=1000)
+    )
+    
+    model = Pipeline([
+        ('preprocessor', preprocessor),
+        ('classifier', stacking_clf)
+    ])
+    
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scores = cross_val_score(model, X, y, cv=skf, scoring='accuracy')
+    return scores.mean()
+
+# Optimize hyperparameters
+study = optuna.create_study(direction='maximize', sampler=TPESampler())
+study.optimize(objective, n_trials=50)
+
+# Retrieve best model parameters and train final model
+best_params = study.best_params
+print(f"Best hyperparameters: {best_params}")
+
+rf = RandomForestClassifier(
+    n_estimators=best_params['rf_n_estimators'],
+    max_depth=best_params['rf_max_depth'],
+    min_samples_split=best_params['rf_min_samples_split'],
+    min_samples_leaf=best_params['rf_min_samples_leaf'],
+    random_state=42
+)
+gbc = GradientBoostingClassifier(
+    n_estimators=best_params['gbc_n_estimators'],
+    learning_rate=best_params['gbc_learning_rate'],
+    max_depth=best_params['gbc_max_depth'],
+    random_state=42
+)
+xgb_clf = xgb.XGBClassifier(
+    n_estimators=best_params['xgb_n_estimators'],
+    learning_rate=best_params['xgb_learning_rate'],
+    max_depth=best_params['xgb_max_depth'],
+    subsample=best_params['xgb_subsample'],
+    colsample_bytree=best_params['xgb_colsample_bytree'],
+    random_state=42
+)
+catboost_clf = CatBoostClassifier(
+    iterations=best_params['catboost_iterations'],
+    learning_rate=best_params['catboost_learning_rate'],
+    depth=best_params['catboost_depth'],
+    silent=True,
+    random_state=42
+)
+lgb_clf = lgb.LGBMClassifier(
+    n_estimators=best_params['lgb_n_estimators'],
+    learning_rate=best_params['lgb_learning_rate'],
+    max_depth=best_params['lgb_max_depth'],
+    num_leaves=best_params['lgb_num_leaves'],
+    min_data_in_leaf=best_params['lgb_min_data_in_leaf'],
+    random_state=42
+)
+
+stacking_clf = StackingClassifier(
+    estimators=[
+        ('rf', rf),
+        ('gbc', gbc),
+        ('xgb', xgb_clf),
+        ('catboost', catboost_clf),
+        ('lgb', lgb_clf)
+    ],
+    final_estimator=LogisticRegression(max_iter=1000)
+)
+
+model = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', stacking_clf)
+])
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+final_scores = cross_val_score(model, X, y, cv=skf, scoring='accuracy')
+final_score = final_scores.mean()
+print(f"Final Stacking Classifier cross-validated accuracy score: {final_score:.2f}")
